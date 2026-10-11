@@ -320,6 +320,8 @@ public:
         bool result = false;
         if (condition->Opcode() == IrOpcode::LogicalAnd) {
             result = Implies(condition->Argument(0), depth + 1u) || Implies(condition->Argument(1), depth + 1u);
+        } else if (condition->Opcode() == IrOpcode::SelectU1) {
+            result = (Implies(condition->Argument(0), depth + 1u) || Implies(condition->Argument(1), depth + 1u)) && Implies(condition->Argument(2), depth + 1u);
         } else if (condition->IsPhi()) {
             result = merges(*condition);
             for (std::size_t index = 0; result && index < condition->ArgumentCount(); ++index) {
@@ -477,20 +479,43 @@ public:
     MaskedLaneWalk(const IrProgram& program, const std::vector<Region>& regions) : program(program), regions(regions), limit(walkLimit(program)), implications(regions, program.WaveSize(), work) {}
 
     bool UnobservedWhereMasked(const IrValue& select, const IrValue* mask) {
-        const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
         work = limit;
+        goals.clear();
+        goals.push_back(Goal{&select, mask});
+        for (std::size_t index = 0; index < goals.size(); ++index) {
+            const Goal goal = goals[index];
+            if (!unobserved(*goal.value, goal.mask, index != 0u)) return false;
+        }
+        return true;
+    }
+
+private:
+    struct Goal {
+        const IrValue* value = nullptr;
+        const IrValue* mask = nullptr;
+
+        bool operator==(const Goal&) const = default;
+    };
+
+    bool unobserved(const IrValue& start, const IrValue* mask, bool sameIteration) {
+        const bool acrossLoops = mask->HasImmediate() || regionOf(regions, mask->Parent()) == Region::Once;
         implications.Reset(mask, acrossLoops);
         startVisits();
         pending.clear();
-        pending.push_back(&select);
-        static_cast<void>(firstVisit(select));
+        pending.push_back(&start);
+        static_cast<void>(firstVisit(start));
         while (!pending.empty()) {
             const IrValue* value = pending.back();
             pending.pop_back();
             for (const IrUse& use : value->OperandUses()) {
                 const IrValue* user = use.user;
-                if (!followable(regions, user->Parent(), acrossLoops)) return false;
+                if (!followable(regions, user->Parent(), acrossLoops) && (!sameIteration || user->IsPhi() || regionOf(regions, user->Parent()) != Region::Loop)) return false;
                 if (isSelect(user->Opcode()) && use.operand == 1u && implications.Implies(user->Argument(0))) continue;
+                if (user->Opcode() == IrOpcode::ReadFirstLane && use.operand == 0u && implications.Implies(user->Argument(1))) {
+                    const Goal goal{user, user->Argument(1)->Resolve()};
+                    if (std::find(goals.begin(), goals.end(), goal) == goals.end()) goals.push_back(goal);
+                    continue;
+                }
                 if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implications.Implies(user->Argument(1u - use.operand))) continue;
                 if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implications.Implies(user->Argument(user->ArgumentCount() - 1u))) continue;
                 if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user)) return false;
@@ -504,7 +529,6 @@ public:
         return true;
     }
 
-private:
     void startVisits() {
         if (++epoch != 0u) return;
         std::fill(visits.begin(), visits.end(), 0u);
@@ -525,6 +549,7 @@ private:
     std::size_t work = 0;
     Implications implications;
     std::vector<const IrValue*> pending;
+    std::vector<Goal> goals;
     std::vector<std::uint32_t> visits;
     std::uint32_t epoch = 0;
 };

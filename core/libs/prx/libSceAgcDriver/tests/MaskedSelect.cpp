@@ -203,7 +203,7 @@ int main() {
 
     passed &= run("cross-lane reads must keep the select", [] {
         bool ok = true;
-        for (const IrOpcode opcode : {IrOpcode::ReadFirstLane, IrOpcode::DppMoveU32, IrOpcode::BpermuteU32, IrOpcode::Permlane16U32, IrOpcode::SwizzleU32}) {
+        for (const IrOpcode opcode : {IrOpcode::DppMoveU32, IrOpcode::BpermuteU32, IrOpcode::Permlane16U32, IrOpcode::SwizzleU32}) {
             Builder b;
             auto& exec = b.mask(16u);
             auto& old = b.lane();
@@ -219,6 +219,98 @@ int main() {
         auto& ballot = b.emit(IrOpcode::Ballot, IrType::U32x4, {&b.emit(IrOpcode::INotEqual32, IrType::Bool, {&written, &b.constant(0u)})});
         b.keep(b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&ballot, &b.constant(0u)}));
         return ok && b.eliminate() == 0u && !removed(written);
+    });
+
+    const auto firstLane = [](bool wideRead, bool wideUse, bool directUse) {
+        Builder b;
+        auto& wide = b.mask(32u);
+        auto& exec = b.logicalAnd(wide, b.mask(16u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& read = b.emit(IrOpcode::ReadFirstLane, IrType::U32, {&written, wideRead ? &wide : &exec});
+        if (directUse) {
+            b.keep(read);
+        } else {
+            b.keep(b.select(wideUse ? wide : exec, read, old));
+        }
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a first-lane read under the write's exec whose value is read only under that exec drops the select", [&] {
+        const auto [count, gone] = firstLane(false, false, false);
+        return count == 1u && gone;
+    });
+
+    passed &= run("a first-lane read under a wider exec keeps the select", [&] {
+        const auto [count, gone] = firstLane(true, false, false);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a first-lane read whose value is read under a wider exec keeps the select", [&] {
+        const auto [count, gone] = firstLane(false, true, false);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a first-lane read whose value is read with no lane active keeps the select", [&] {
+        const auto [count, gone] = firstLane(false, false, true);
+        return count == 0u && !gone;
+    });
+
+    const auto firstLaneInLoop = [](bool carried) {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrBlock& head = *b.block;
+        IrBlock& loop = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        head.AddBranch(&loop);
+        loop.AddBranch(&loop);
+        loop.AddBranch(&exit);
+        b.block = &loop;
+        auto& loopExec = b.phi(IrType::Bool, head, exec);
+        auto& previous = b.phi(IrType::U32, head, old);
+        auto& read = b.emit(IrOpcode::ReadFirstLane, IrType::U32, {&written, &loopExec});
+        loopExec.AddPhiOperand(&loop, &b.logicalAnd(loopExec, b.mask(8u)));
+        previous.AddPhiOperand(&loop, carried ? &read : &old);
+        b.keep(b.select(loopExec, carried ? previous : read, old));
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a first-lane read inside a loop whose value is read in the same iteration under the loop's exec drops the select", [&] {
+        const auto [count, gone] = firstLaneInLoop(false);
+        return count == 1u && gone;
+    });
+
+    passed &= run("a first-lane read inside a loop whose value is carried to the next iteration keeps the select", [&] {
+        const auto [count, gone] = firstLaneInLoop(true);
+        return count == 0u && !gone;
+    });
+
+    const auto chosenExec = [](bool wideCondition, bool wideActive, bool wideInactive) {
+        Builder b;
+        auto& wide = b.mask(32u);
+        auto& exec = b.logicalAnd(wide, b.mask(16u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& condition = wideCondition ? b.mask(48u) : b.logicalAnd(exec, b.mask(12u));
+        auto& active = wideActive ? wide : b.logicalAnd(exec, b.mask(8u));
+        auto& inactive = wideInactive ? wide : b.logicalAnd(exec, b.mask(4u));
+        auto& chosen = b.emit(IrOpcode::SelectU1, IrType::Bool, {&condition, &active, &inactive});
+        b.keep(b.select(chosen, b.add(written, 2u), old));
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("an exec chosen between two execs that both imply the write's exec drops the select", [&] {
+        const auto [count, gone] = chosenExec(true, false, false);
+        const auto [guardedCount, guardedGone] = chosenExec(false, true, false);
+        return count == 1u && gone && guardedCount == 1u && guardedGone;
+    });
+
+    passed &= run("an exec chosen between two execs with a wider alternative keeps the select", [&] {
+        const auto [count, gone] = chosenExec(true, true, false);
+        const auto [otherCount, otherGone] = chosenExec(false, false, true);
+        return count == 0u && !gone && otherCount == 0u && !otherGone;
     });
 
     passed &= run("a branch condition derived from the write keeps the select", [] {
